@@ -1,0 +1,490 @@
+#!/usr/bin/perl -wT --
+#
+# $Id: pcaparse,v 0.0.1 2015/03/06 16:47:10 raven Exp $
+# - Initial release
+#
+# $Id: pcaparse,v 0.0.2 2015/27/11 15:02:09 raven Exp $
+# - Added per-port stats for /32 source / destination;
+# - Added average sample size column
+#
+# $Id: pcaparse,v 0.0.3 2015/30/11 22:45:27 raven Exp $
+# - Output code rewrite
+#
+# $Id: pcaparse,v 0.0.4 2015/03/12 16:04:15 raven Exp $
+# - Fixed an error with run time calculation
+#
+# $Id: pcaparse,v 0.0.5 2015/11/12 10:11:32 raven Exp $
+# - Added STDIN PCAP data source support
+#
+# $Id: pcaparse,v 0.0.6 2015/24/12 14:57:02 raven Exp $
+# - Fixed a bug with older Net::Pcap versions functions call;
+# - Initial public release
+#
+# $Id: pcaparse,v 0.0.7 2016/04/01 13:00:49 raven Exp $
+# - Added parser-friendly output
+#
+use strict;
+use warnings 'FATAL' => 'all';
+use Getopt::Long qw(:config no_ignore_case pass_through);
+use Pod::Usage;
+use Net::Pcap qw(:functions);
+use Data::Validate::IP;
+use Socket;
+use Net::Netmask;
+use NetPacket::Ethernet qw(:types);
+use NetPacket::IP qw(:protos);
+use NetPacket::UDP qw();
+use NetPacket::TCP qw();
+use NetPacket::ICMP qw();
+use Time::HiRes;
+# use Data::Dumper;
+
+use constant {
+  VERSION => '0.0.7',
+  # -f filename.pcap            - read data from filename, '-' for STDIN;
+  # -s [ ip_addr [ /prefix ] ]  - group by source; skip samples not
+  #                               matching ip_addr/prefix;
+  # -d [ ip_addr [ /prefix ] ]  - group by destination; skip samples
+  #                               not matching ip_addr/prefix;
+  # -S                          - sort results by summary samples size
+  #                               instead of samples count;
+  # -V                          - print version and exit;
+  # -q                          - do not print summary;
+  # -v                          - print VERY verbose stats (NOT recommended);
+  # -n X                        - show X results;
+  # -N X                        - parse X samples;
+  # -p                          - be parser-friendly (print easy to parse output),
+  #                               also employs '-q' switch;
+  # -h | --help                 - show this help message.
+  OPTIONS => [ qw(s:s d:s v! q! S! V! p! n=i N=i f=s h|help!) ],
+  RESULTS => 10,
+  SAMPLES => -1
+};
+
+$ENV{'PATH'} = '/bin:/usr/bin';
+delete @ENV{ qw(IFS CDPATH ENV BASH_ENV) };
+
+# $flow  - reference to 'group by' hash
+# $max   - reference to 'sort by' hash
+# $total - reference to summary info hash
+use vars qw($flow $max $total %opt);
+$total->{'run'} = Time::HiRes::time;
+
+sub convert($@) {
+  my $var = shift;
+  my $opt = shift;
+  $opt->{'block'} ||= 1024;
+  $opt->{'precision'} ||= 2;
+  $var ||= 0;
+  my $prefix = '';
+  my @prefix = qw(k M G T P E Z Y);
+  while (@prefix && $var > $opt->{'block'}) {
+    $prefix = shift @prefix;
+    $var /= $opt->{'block'};
+  }
+  $opt->{'precision'} = '' if $prefix eq '';
+  return sprintf('%.' . $opt->{'precision'} . 'f%s', $var, $prefix);
+}
+
+sub printobj($@) {
+  my $ip = shift;
+  # $v - verbocity level
+  # 0 - minimal verbocity (default) - print only summary
+  # 1 - print per-protocol summary
+  # 2 - print per-port summary for tcp/udp and per-protocol
+  #     for other protocols
+  my $opt = shift;
+  $opt->{'verbose'}   ||= 0;
+  $opt->{'parseable'} ||= 0;
+  # Print default verbocity line, same for all $v levels
+  if ($opt->{'parseable'} == 1) {
+    my $i_size = sprintf('%i', $flow->{$ip}->{'count'} == 0 ? 0 : $flow->{$ip}->{'size'} / $flow->{$ip}->{'count'});
+    printf "%-15s %-15s %12s %12s %10s\n",
+        $ip,
+        'total',
+        $flow->{$ip}->{'count'},
+        $flow->{$ip}->{'size'},
+        $i_size;
+    if ($opt->{'verbose'} > 0) {
+      foreach my $proto (qw(tcp udp icmp other)) {
+        printf "%-15s %-15s %12s %12s %10s\n",
+                $ip,
+                $proto,
+                $flow->{$ip}->{$proto}->{'count'},
+                $flow->{$ip}->{$proto}->{'size'},
+                ($flow->{$ip}->{$proto}->{'count'} == 0 ?
+                0 :
+                sprintf('%i', $flow->{$ip}->{$proto}->{'size'} / $flow->{$ip}->{$proto}->{'count'}));
+        if ($proto =~ /^(tc|ud)p$/ and $opt->{'verbose'} == 2) {
+          foreach my $port (sort { $a <=> $b } grep(/^\d+$/, keys %{$flow->{$ip}->{$proto}})) {
+            printf "%-15s %-15s %12s %12s %10s\n",
+                $ip,
+                $proto . ':' . $port,
+                $flow->{$ip}->{$proto}->{$port}->{'count'},
+                $flow->{$ip}->{$proto}->{$port}->{'size'},
+                sprintf('%i', $flow->{$ip}->{$proto}->{$port}->{'size'} / $flow->{$ip}->{$proto}->{$port}->{'count'});
+          }
+        }
+      }
+    }
+  } else {
+    my $i_size = $flow->{$ip}->{'count'} == 0 ? 0 : convert($flow->{$ip}->{'size'} / $flow->{$ip}->{'count'});
+    printf "%-28s %6s %9sB %9sB\n",
+        $ip,
+        convert($flow->{$ip}->{'count'}, { block => 1000 }),
+        convert($flow->{$ip}->{'size'}),
+        $i_size;
+    if ($opt->{'verbose'} > 0) {
+      foreach my $proto (qw(tcp udp icmp other)) {
+        printf "  %-26s %6s %9sB %9sB\n",
+                $proto . ':',
+                $flow->{$ip}->{$proto}->{'count'},
+                convert($flow->{$ip}->{$proto}->{'size'}),
+                ($flow->{$ip}->{$proto}->{'count'} == 0 ?
+                0 :
+                convert($flow->{$ip}->{$proto}->{'size'} / $flow->{$ip}->{$proto}->{'count'}));
+        if ($proto =~ /^(tc|ud)p$/ and $opt->{'verbose'} == 2) {
+          foreach my $port (sort { $a <=> $b } grep(/^\d+$/, keys %{$flow->{$ip}->{$proto}})) {
+            my $serv = (getservbyport $port, $proto)[0];
+            $serv = $serv ? sprintf('%i (%s)', $port, $serv) : $port;
+            printf "    %-24s %6s %9sB %9sB\n",
+                $serv,
+                $flow->{$ip}->{$proto}->{$port}->{'count'},
+                convert($flow->{$ip}->{$proto}->{$port}->{'size'}),
+                convert($flow->{$ip}->{$proto}->{$port}->{'size'} / $flow->{$ip}->{$proto}->{$port}->{'count'});
+          }
+        }
+      }
+    }
+  }
+}
+
+sub process(@) {
+  # Check perldoc Net::Pcap for details
+  my($data, $hdr, $frame) = @_;
+  my $ip = undef;
+  my $eth = NetPacket::Ethernet->decode($frame);
+  # Update totals
+  $total->{'count'} ++;
+  $total->{'size'} += $hdr->{'len'};
+  # Parse thernet frame
+  if ($eth->{'type'} == ETH_TYPE_IP) {
+    my $pkt = NetPacket::IP->decode($eth->{'data'});
+    $ip = $pkt->{'dest_ip'};
+  # Yes, we still know only IPv4 :(
+    if (defined $opt{'d'}) {
+      return unless is_innet_ipv4($ip, $opt{'d'});
+    }
+    if (defined $opt{'s'}) {
+      $ip = $pkt->{'src_ip'};
+      return unless is_innet_ipv4($ip, $opt{'s'});
+    }
+  # And update totals again (matched only)
+    $total->{'match'}->{'count'} ++;
+    $total->{'match'}->{'size'} += $hdr->{'len'};
+  # Here goes TCP/IP sample parsing
+    if ($pkt->{'proto'} == IP_PROTO_TCP) {
+      my $tcp = NetPacket::TCP->decode($pkt->{'data'});
+      my $port = exists $opt{'d'} ? $tcp->{'dest_port'} : $tcp->{'src_port'};
+      return unless defined $port;
+      $total->{'tcp'}->{'count'} ++;
+      $total->{'tcp'}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'count'} ++;
+      $flow->{$ip}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'tcp'}->{'count'} ++;
+      $flow->{$ip}->{'tcp'}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'tcp'}->{$port}->{'count'} ++;
+      $flow->{$ip}->{'tcp'}->{$port}->{'size'} += $hdr->{'len'};
+  # And UDP sample parsing
+    } elsif ($pkt->{'proto'} == IP_PROTO_UDP) {
+      my $udp = NetPacket::UDP->decode($pkt->{'data'});
+      my $port = exists $opt{'d'} ? $udp->{'dest_port'} : $udp->{'src_port'};
+      return unless defined $port;
+      $total->{'udp'}->{'count'} ++;
+      $total->{'udp'}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'count'} ++;
+      $flow->{$ip}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'udp'}->{'count'} ++;
+      $flow->{$ip}->{'udp'}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'udp'}->{$port}->{'count'} ++;
+      $flow->{$ip}->{'udp'}->{$port}->{'size'} += $hdr->{'len'};
+  # And ICMP sample parsing
+    } elsif ($pkt->{'proto'} == IP_PROTO_ICMP) {
+      $total->{'icmp'}->{'count'} ++;
+      $total->{'icmp'}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'count'} ++;
+      $flow->{$ip}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'icmp'}->{'count'} ++;
+      $flow->{$ip}->{'icmp'}->{'size'} += $hdr->{'len'};
+  # And, at least, all other samples
+    } else {
+      $total->{'other'}->{'count'} ++;
+      $total->{'other'}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'count'} ++;
+      $flow->{$ip}->{'size'} += $hdr->{'len'};
+      $flow->{$ip}->{'other'}->{'count'} ++;
+      $flow->{$ip}->{'other'}->{'size'} += $hdr->{'len'};
+    }
+  }
+}
+
+# Setting default options
+GetOptions \%opt, @{(OPTIONS)};
+pod2usage -verbose => 2 if exists $opt{'h'};
+if (exists $opt{'V'}) {
+  my $year = (localtime time)[5] + 1900;
+  printf "%s v.%s (c) raven 2015%s\n",
+        ($0 =~ m|([^/]+)$|),
+        VERSION,
+        $year == 2015 ? '' : '-' . $year;
+  exit;
+}
+# Check for setting either -d, either -s option; -d by default
+if (not exists $opt{'d'} and not exists $opt{'s'}) {
+  $opt{'d'} = undef;
+} elsif (exists $opt{'d'} and exists $opt{'s'}) {
+  die 'You would use either -d, either -s option at the time';
+} elsif (exists $opt{'d'} and $opt{'d'} eq '') {
+  undef $opt{'d'};
+} elsif (exists $opt{'s'} and $opt{'s'} eq '') {
+  undef $opt{'s'};
+}
+die 'You would use either -q, either -v option at the time' if
+        exists $opt{'q'} and exists $opt{'v'};
+$opt{'n'} ||= RESULTS;
+$opt{'N'} ||= SAMPLES;
+$opt{'q'} = 1 if exists $opt{'p'};
+$opt{'p'} ||= 0;
+# Taking first unparsed argument unless PCAP filename was not provided
+$opt{'f'} ||= shift if $#ARGV > -1;
+# Fall back to STDIN if filename still not exist.
+$opt{'f'} = '-' unless exists $opt{'f'};
+# Setting $flow->{$ip} key explicitly to provide defaults fallback if no
+# samples for the $ip will be found
+my $ip = exists $opt{'d'} ? $opt{'d'} : $opt{'s'};
+if (defined $ip and Net::Netmask->new($ip)->mask() eq '255.255.255.255') {
+  $ip = Net::Netmask->new($ip)->base();
+  $flow->{$ip} = undef;
+}
+
+# Parsing PCAP file
+my $pcap = undef;
+$pcap = Net::Pcap::pcap_open_offline($opt{'f'}, \my $err);
+die $err if $err;
+Net::Pcap::loop $pcap, $opt{'N'}, \&process, undef;
+Net::Pcap::pcap_close $pcap;
+$total->{'run'} = Time::HiRes::time - $total->{'run'};
+
+# Setting zero-values for sprintfs.
+$total->{'match'}->{'count'} ||= 0;
+$total->{'match'}->{'size'} ||= 0;
+foreach (qw(tcp udp icmp other)) {
+  $total->{$_}->{'count'} ||= 0;
+  $total->{$_}->{'size'} ||= 0;
+}
+foreach my $ip (keys %$flow) {
+  $flow->{$ip}->{'size'} ||= 0;
+  $flow->{$ip}->{'tcp'}->{'size'} ||= 0;
+  $flow->{$ip}->{'udp'}->{'size'} ||= 0;
+  $flow->{$ip}->{'icmp'}->{'size'} ||= 0;
+  $flow->{$ip}->{'other'}->{'size'} ||= 0;
+  $flow->{$ip}->{'count'} ||= 0;
+  $flow->{$ip}->{'tcp'}->{'count'} ||= 0;
+  $flow->{$ip}->{'udp'}->{'count'} ||= 0;
+  $flow->{$ip}->{'icmp'}->{'count'} ||= 0;
+  $flow->{$ip}->{'other'}->{'count'} ||= 0;
+  # And storing IPs in case samples count or size will be
+  # the same for different addresses (yes, probabililty is
+  # very close 0, but it still is not equal)
+  my $size = $flow->{$ip}->{'size'};
+  my $count = $flow->{$ip}->{'count'};
+  push @{$max->{'size'}->{$size}}, $ip;
+  push @{$max->{'count'}->{$count}}, $ip;
+}
+
+# Pushing summary data to temporary array (seems unnecessary, but
+# much more comfortable to add some extras).
+my @head = (
+        $opt{'f'},
+        $opt{'f'} eq '-' ? '-' : convert((stat $opt{'f'})[7]) . 'B',
+        $total->{'count'},
+        $total->{'run'},
+        $total->{'match'}->{'count'},
+        convert($total->{'match'}->{'size'}),
+        $total->{'tcp'}->{'count'},
+        convert($total->{'tcp'}->{'size'}),
+        $total->{'udp'}->{'count'},
+        convert($total->{'udp'}->{'size'}),
+        $total->{'icmp'}->{'count'},
+        convert($total->{'icmp'}->{'size'}),
+        $total->{'other'}->{'count'},
+        convert($total->{'other'}->{'size'})
+);
+
+# Printing nice summary
+printf <<'__SUMMARY__', @head unless exists $opt{'q'};
+Filename:                   %s
+File size:                  %s
+Parsed:                     %i samples in %.2f seconds
+Matched:                    %i samples / %sB
+  tcp:                      %i samples / %sB
+  udp:                      %i samples / %sB
+  icmp:                     %i samples / %sB
+  other:                    %i samples / %sB
+
+__SUMMARY__
+printf <<'__HEADER__', (exists $opt{'d'} ? 'Destination' : 'Source') unless $opt{'p'} == 1;
+                            Samples    Summary    Average
+%-11s                   count       size       size
+__HEADER__
+
+# And printing some needful data for which all the game was started
+my $n = 1;
+if (defined $ip and Net::Netmask->new($ip)->mask() eq '255.255.255.255') {
+  # Very verbose for certain IP
+  printobj $ip, { verbose => 2, parseable => $opt{'p'} };
+} else {
+  # And not so verbose for list
+  foreach my $key (reverse sort { $a <=> $b } keys %{$max->{ ($opt{'S'} ? 'size' : 'count') }}) {
+  # Yes, we still remember about probability to have equal counters
+  # for different IPs, and we'll mention'em all
+    foreach (@{ $max->{ ($opt{'S'} ? 'size' : 'count') }->{$key} }) {
+      if (exists $opt{'v'}) {
+        printobj $_, { verbose => 2, parseable => $opt{'p'} };
+      } elsif (exists $opt{'q'}) {
+        printobj $_, { parseable => $opt{'p'} };
+      } else {
+        printobj $_, { verbose => ($n == 1 ? 1 : 0), parseable => $opt{'p'} };
+      }
+      $n++;
+      exit if $n > $opt{'n'};
+    }
+  }
+}
+
+__DATA__
+
+=head1 NAME
+
+B<pcaparse> - simple B<PCAP> file parser.
+
+You would still use B<tcpdump> or B<wireshark> instead, if You want more details.
+
+=head1 SYNOPSIS
+
+B<pcaparse> [ options ] [ -f ] <B<filename.pcap>>
+
+B<pcaparse> [ -h | --help ]
+
+=head1 PREREQUISITES
+
+This tool depends on:
+
+=over 8
+
+=item - Net::Pcap
+
+=item - Data::Validate::IP
+
+=item - NetPacket::Ethernet
+
+=item - NetPacket::IP
+
+=item - NetPacket::UDP
+
+=item - NetPacket::TCP
+
+=item - NetPacket::ICMP
+
+=back
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-f E<lt>filename.pcap | -E<gt>>
+
+PCAP file to parse (for example, you can write the file using B<tcpdump -w>). If
+no filename was provided or this option is set to 'B<->', B<STDIN> is used. Useful
+for almost real time traffic analyse (B<tcpdump -w - | pcaparse>).
+
+=item B<-q>
+
+Be quiet - do not print B<filename.pcap> general information (quantity and size
+of records, parse time etc).
+
+=item B<-n N>
+
+Print top N results (default is 10);
+
+=item B<-N X>
+
+Parse X samples and exit. Program parses all available data by default.
+
+=item B<-d [ ip [ /prefix ] ]>
+
+Group data by destination IP address (default). Skip all samples, that does
+not match specified ip/prefix. Causes to show per-port statistics if single
+address or /32 network was provided.
+
+=item B<-s [ ip [ /prefix ] ] >
+
+Group data by source IP address. Skip all samples, that does not match
+specified ip/prefix. Causes to show per-port statistics if single address
+or /32 network was provided.
+
+=item B<-S>
+
+Sort by summary samples size instead of samples count.
+
+=item B<-v>
+
+Print verbose statistics for all addresses.
+
+=item B<-p>
+
+Be parser-friendly (print easy to parse output) - '-q' switch
+is employed and all values are not converted to human-readable
+format.
+
+=item B<-V>
+
+Print script version and exit.
+
+=item B<-h | --help>
+
+Print this help message and exit.
+
+=back
+
+=head1 TODO
+
+=over 8
+
+=item - Rewrite IP address matching code using pack().
+
+=item - IPv6 support.
+
+=back
+
+=head1 VERSION
+
+B<0.0.1> - initial release;
+
+B<0.0.2> - added per-port stats for /32 networks;
+
+B<0.0.3> - output code rewrite;
+
+B<0.0.4> - fixed error with run time calculation;
+
+B<0.0.5> - added STDIN data source support.
+
+B<0.0.6> - fixed a bug with older Net::Pcap versions, initial public release.
+
+B<0.0.7> - added parser-friendly output.
+
+=head1 AUTHOR
+
+Volodymyr O. Pidgornyi <raven@adamant.ua>
+
+=cut
