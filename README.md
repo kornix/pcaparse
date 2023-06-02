@@ -94,9 +94,7 @@ This tool depends on:
 ### HISTORY
 **0.0.7** - added parser-friendly output;
 
-**0.0.6** - fixed a bug with older Net::Pcap versions;
-          
-          - initial public release;
+**0.0.6** - fixed a bug with older Net::Pcap versions, initial public release;
           
 **0.0.5** - added STDIN data source support.
 
