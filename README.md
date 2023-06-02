@@ -7,12 +7,12 @@
 
 This tool is used in conjunction with either **tcpdump** of **wireshark**, e. g.:
 
-Dump 1000 packets on interface eno1 and write capture to STDOUT, pipe it
+- Dump 1000 packets on interface eno1 and write capture to STDOUT, pipe it
 to pcaparse' STDIN, sort results by destination:
 ```
 tcpdump -i eno1 -c 1000 -w - | pcaparse -f - -d
 ```
-Check for main sources of NTP amplification DDoS attack to *IP_ADDRESS*:
+- Check for main sources of NTP amplification DDoS attack to *IP_ADDRESS*:
 ```
 tcpdump -c 1000 -w - dst IP_ADDRESS and proto 17 and port 123 | pcaparse -f - -s
 ```
